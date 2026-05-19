@@ -1,13 +1,27 @@
+import { useEffect } from "react";
 import { Track } from "./components/Track";
+import { PromptBar } from "./components/PromptBar";
+import { DebugPanel } from "./components/DebugPanel";
+import { FuelGauge } from "./components/FuelGauge";
+import { Transcript } from "./components/Transcript";
+import { ensureWired } from "./state/claudeStore";
 import "./App.css";
 
 function App() {
+  useEffect(() => {
+    ensureWired();
+  }, []);
+
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-neutral-950 text-neutral-200">
       <Track />
       <div className="pointer-events-none absolute left-4 top-4 z-10 font-mono text-xs uppercase tracking-widest text-neutral-500">
-        Paddock AI · placeholder lap
+        Paddock AI
       </div>
+      <FuelGauge />
+      <Transcript />
+      <DebugPanel />
+      <PromptBar />
     </main>
   );
 }
