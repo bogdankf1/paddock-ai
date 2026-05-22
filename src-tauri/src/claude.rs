@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{oneshot, Mutex};
 
-const APP_CWD: &str = "/Users/bohdanburukhin/Projects/paddock-ai";
+const APP_CWD: &str = "/Users/bohdanburukhin/Projects/personal/paddock-ai";
 
 #[derive(Default)]
 pub struct ClaudeState {

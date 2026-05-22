@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Application, extend, useTick } from "@pixi/react";
 import { Container, Graphics } from "pixi.js";
-import { pointOnEllipse } from "../lib/path";
+import { spaPath, type PathSampler } from "../lib/path";
 import { useClaudeStore, type AgentState } from "../state/claudeStore";
 
 extend({ Container, Graphics });
@@ -10,10 +10,12 @@ const TRACK_WIDTH = 1200;
 const TRACK_HEIGHT = 720;
 const CX = TRACK_WIDTH / 2;
 const CY = TRACK_HEIGHT / 2;
-const RX = 460;
-const RY = 240;
-const LAP_SECONDS = 14;
-const PIT_T = 0.5; // 9 o'clock — left side of oval
+const FIT_W = 1080;
+const FIT_H = 600;
+const LAP_SECONDS = 28;
+const PIT_T = 0.0; // path start — adjust after eyeballing
+const ASPHALT_WIDTH = 28;
+const KERB_WIDTH = 32;
 
 const CAR_COLOR: Record<AgentState, number> = {
   IDLE: 0x6b7280,
@@ -36,7 +38,7 @@ function forwardDistance(from: number, to: number) {
   return d;
 }
 
-function Car() {
+function Car({ sampler }: { sampler: PathSampler }) {
   const agentState = useClaudeStore((s) => s.agentState);
   const tRef = useRef(PIT_T);
   const angleRef = useRef(0);
@@ -50,36 +52,31 @@ function Car() {
       agentState === "EXECUTING" || agentState === "COMPLETE";
 
     if (freeDriving) {
-      // Always forward at full speed.
       tRef.current = (tRef.current + baseSpeed * dt) % 1;
       wobbleRef.current = 0;
     } else {
-      // IDLE / PLANNING / ERROR: ease forward into the pit, never backwards.
       const d = forwardDistance(tRef.current, PIT_T);
       if (d < 0.0015 || d > 0.9985) {
         tRef.current = PIT_T;
-        // Pit-lane idle wobble — strongest while mechanics are "working" (PLANNING).
         if (agentState === "PLANNING") {
           wobbleRef.current += dt;
         } else {
           wobbleRef.current = 0;
         }
       } else {
-        // Decelerate within the last ~20% of the lap before the pit.
         const speedFactor = Math.min(1, d * 4 + 0.2);
         tRef.current = (tRef.current + baseSpeed * speedFactor * dt) % 1;
         wobbleRef.current = 0;
       }
     }
 
-    const { angle } = pointOnEllipse(tRef.current, CX, CY, RX, RY);
+    const { angle } = sampler.point(tRef.current);
     angleRef.current = lerpAngle(angleRef.current, angle, Math.min(1, dt * 6));
     forceRender((n) => (n + 1) & 0xffff);
   });
 
-  const { x, y } = pointOnEllipse(tRef.current, CX, CY, RX, RY);
+  const { x, y } = sampler.point(tRef.current);
   const color = CAR_COLOR[agentState];
-  // Small mechanics wobble at the pit during PLANNING.
   const wobble =
     agentState === "PLANNING" ? Math.sin(wobbleRef.current * 6) * 0.04 : 0;
 
@@ -97,26 +94,47 @@ function Car() {
   );
 }
 
-function TrackPath() {
+function tracePath(g: Graphics, samples: { x: number; y: number }[]) {
+  g.moveTo(samples[0].x, samples[0].y);
+  for (let i = 1; i < samples.length; i++) {
+    g.lineTo(samples[i].x, samples[i].y);
+  }
+  g.closePath();
+}
+
+function TrackPath({ sampler }: { sampler: PathSampler }) {
   return (
     <pixiGraphics
       draw={(g) => {
         g.clear();
-        g.ellipse(CX, CY, RX + 28, RY + 28).fill(0x1a1a1a);
-        g.ellipse(CX, CY, RX - 28, RY - 28).fill(0x0a0a0a);
-        g.ellipse(CX, CY, RX + 28, RY + 28).stroke({ color: 0x3a3a3a, width: 2 });
-        g.ellipse(CX, CY, RX - 28, RY - 28).stroke({ color: 0x3a3a3a, width: 2 });
-        // pit marker — small box on the left side of the inner edge
-        const pit = pointOnEllipse(PIT_T, CX, CY, RX - 28, RY - 28);
-        g.rect(pit.x - 4, pit.y - 18, 8, 36).fill(0x2a2a2a);
-        g.rect(pit.x - 4, pit.y - 18, 8, 36).stroke({ color: 0x4a4a4a, width: 1 });
+        tracePath(g, sampler.samples);
+        g.stroke({
+          color: 0x3a3a3a,
+          width: KERB_WIDTH * 2,
+          cap: "round",
+          join: "round",
+        });
+        tracePath(g, sampler.samples);
+        g.stroke({
+          color: 0x1a1a1a,
+          width: ASPHALT_WIDTH * 2,
+          cap: "round",
+          join: "round",
+        });
+        const pit = sampler.point(PIT_T);
+        g.circle(pit.x, pit.y, 7)
+          .fill(0x2a2a2a)
+          .stroke({ color: 0x6b7280, width: 1.5 });
       }}
     />
   );
 }
 
+const VIEWPORT_PAD = 40;
+
 export function Track() {
   const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
+  const sampler = useMemo(() => spaPath(CX, CY, FIT_W, FIT_H), []);
 
   useEffect(() => {
     const onResize = () =>
@@ -125,20 +143,23 @@ export function Track() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  const scale = Math.min(
+    (size.w - VIEWPORT_PAD * 2) / TRACK_WIDTH,
+    (size.h - VIEWPORT_PAD * 2) / TRACK_HEIGHT,
+  );
+  const offsetX = (size.w - TRACK_WIDTH * scale) / 2;
+  const offsetY = (size.h - TRACK_HEIGHT * scale) / 2;
+
   return (
     <div className="absolute inset-0">
       <Application
-        width={size.w}
-        height={size.h}
+        resizeTo={window}
         background={0x0a0a0a}
         antialias
       >
-        <pixiContainer
-          x={(size.w - TRACK_WIDTH) / 2}
-          y={(size.h - TRACK_HEIGHT) / 2}
-        >
-          <TrackPath />
-          <Car />
+        <pixiContainer x={offsetX} y={offsetY} scale={scale}>
+          <TrackPath sampler={sampler} />
+          <Car sampler={sampler} />
         </pixiContainer>
       </Application>
     </div>
