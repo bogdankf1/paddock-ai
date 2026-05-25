@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { clearEvents, useClaudeStore } from "../state/claudeStore";
+import { clearEvents, useSelectedAgent } from "../state/claudeStore";
 
 const TYPE_COLORS: Record<string, string> = {
   system: "text-sky-400",
@@ -12,12 +12,14 @@ const TYPE_COLORS: Record<string, string> = {
 };
 
 export function DebugPanel() {
-  const events = useClaudeStore((s) => s.events);
-  const status = useClaudeStore((s) => s.status);
-  const exitCode = useClaudeStore((s) => s.exitCode);
+  const agent = useSelectedAgent();
   const [collapsed, setCollapsed] = useState(true);
   const listRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
+
+  const events = agent?.events ?? [];
+  const status = agent?.status ?? "idle";
+  const exitCode = agent?.exitCode ?? null;
 
   useEffect(() => {
     const el = listRef.current;
@@ -45,8 +47,9 @@ export function DebugPanel() {
         <div className="flex items-center gap-1">
           <button
             type="button"
-            onClick={clearEvents}
-            className="rounded px-2 py-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+            onClick={() => agent && clearEvents(agent.id)}
+            disabled={!agent}
+            className="rounded px-2 py-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-30"
           >
             clear
           </button>

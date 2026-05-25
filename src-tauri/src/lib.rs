@@ -9,6 +9,7 @@ pub fn run() {
         .manage(claude::ClaudeState::default())
         .invoke_handler(tauri::generate_handler![
             claude::claude_run,
+            claude::claude_followup,
             claude::claude_stop,
             claude::claude_status,
         ])

@@ -3,17 +3,30 @@ import {
   onClaudeEvent,
   onClaudeLifecycle,
   type ClaudeEvent,
+  type ClaudeEventPayload,
   type ClaudeLifecycle,
+  type ClaudeModel,
 } from "../lib/claude";
 
 const MAX_EVENTS = 500;
 const FUEL_TANK_TOKENS = 200_000;
 const COMPLETE_HOLD_MS = 4000;
 
+export const AGENT_PALETTE = [
+  0xef4444, // red
+  0x3b82f6, // blue
+  0xf59e0b, // amber
+  0x10b981, // emerald
+  0xa855f7, // violet
+  0xec4899, // pink
+  0x06b6d4, // cyan
+  0xfb923c, // orange
+] as const;
+
 export type StoredEvent = {
   id: number;
   receivedAtMs: number;
-  payload: ClaudeEvent;
+  payload: ClaudeEventPayload;
 };
 
 export type AgentState =
@@ -23,7 +36,7 @@ export type AgentState =
   | "COMPLETE"
   | "ERROR";
 
-type Status = "idle" | "running" | "error";
+export type Status = "idle" | "running" | "error";
 
 export type TranscriptEntry =
   | { kind: "user"; id: number; ts: number; text: string }
@@ -53,42 +66,56 @@ export type TranscriptEntry =
       message: string | null;
     };
 
-export type ClaudeStoreState = {
-  events: StoredEvent[];
-  transcript: TranscriptEntry[];
+export type AgentRecord = {
+  id: string;
+  index: number;
+  color: number;
+  prompt: string;
+  startedAtMs: number;
   status: Status;
   agentState: AgentState;
-  startedAtMs: number | null;
   exitCode: number | null;
   lastError: string | null;
   tokensUsed: number;
   tankCapacity: number;
   model: string | null;
+  requestedModel: ClaudeModel;
+  sessionId: string | null;
   activeTool: string | null;
+  transcript: TranscriptEntry[];
+  events: StoredEvent[];
+};
+
+export type ClaudeStoreState = {
+  agents: Record<string, AgentRecord>;
+  agentOrder: string[];
+  selectedId: string | null;
 };
 
 const listeners = new Set<() => void>();
 let state: ClaudeStoreState = {
-  events: [],
-  transcript: [],
-  status: "idle",
-  agentState: "IDLE",
-  startedAtMs: null,
-  exitCode: null,
-  lastError: null,
-  tokensUsed: 0,
-  tankCapacity: FUEL_TANK_TOKENS,
-  model: null,
-  activeTool: null,
+  agents: {},
+  agentOrder: [],
+  selectedId: null,
 };
-let nextId = 1;
+let cachedAgentList: AgentRecord[] = [];
+let nextEventId = 1;
 let nextEntryId = 1;
-let completeTimer: ReturnType<typeof setTimeout> | null = null;
-// Parser state for streaming content blocks: content_block_index → transcript entry id.
-const openBlocks = new Map<number, number>();
+
+const completeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const openBlocks = new Map<string, Map<number, number>>();
+
+function recomputeCaches() {
+  cachedAgentList = state.agentOrder
+    .map((id) => state.agents[id])
+    .filter((a): a is AgentRecord => Boolean(a));
+}
 
 function setState(updater: (s: ClaudeStoreState) => ClaudeStoreState) {
-  state = updater(state);
+  const next = updater(state);
+  if (next === state) return;
+  state = next;
+  recomputeCaches();
   for (const l of listeners) l();
 }
 
@@ -107,7 +134,7 @@ function asRecord(v: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function extractTokens(payload: ClaudeEvent): number | null {
+function extractTokens(payload: ClaudeEventPayload): number | null {
   const p = asRecord(payload);
   if (!p) return null;
   if (typeof p.total_tokens === "number") return p.total_tokens as number;
@@ -138,27 +165,45 @@ function extractTokens(payload: ClaudeEvent): number | null {
   return null;
 }
 
-function pushTranscript(entry: TranscriptEntry) {
-  setState((s) => ({ ...s, transcript: s.transcript.concat(entry) }));
+function updateAgent(
+  id: string,
+  updater: (a: AgentRecord) => AgentRecord,
+) {
+  setState((s) => {
+    const existing = s.agents[id];
+    if (!existing) return s;
+    return { ...s, agents: { ...s.agents, [id]: updater(existing) } };
+  });
+}
+
+function pushTranscript(id: string, entry: TranscriptEntry) {
+  updateAgent(id, (a) => ({ ...a, transcript: a.transcript.concat(entry) }));
 }
 
 function updateEntry(
-  id: number,
+  id: string,
+  entryId: number,
   updater: (e: TranscriptEntry) => TranscriptEntry,
 ) {
-  setState((s) => ({
-    ...s,
-    transcript: s.transcript.map((e) => (e.id === id ? updater(e) : e)),
+  updateAgent(id, (a) => ({
+    ...a,
+    transcript: a.transcript.map((e) => (e.id === entryId ? updater(e) : e)),
   }));
 }
 
-function processStreamEvent(p: Record<string, unknown>) {
+function processStreamEvent(agentId: string, p: Record<string, unknown>) {
   const ev = asRecord(p.event);
   if (!ev) return;
   const evType = ev.type as string | undefined;
 
+  let blocks = openBlocks.get(agentId);
+  if (!blocks) {
+    blocks = new Map();
+    openBlocks.set(agentId, blocks);
+  }
+
   if (evType === "message_start") {
-    openBlocks.clear();
+    blocks.clear();
     return;
   }
 
@@ -169,8 +214,8 @@ function processStreamEvent(p: Record<string, unknown>) {
     const cbType = cb.type as string | undefined;
     if (cbType === "text") {
       const entryId = nextEntryId++;
-      openBlocks.set(idx, entryId);
-      pushTranscript({
+      blocks.set(idx, entryId);
+      pushTranscript(agentId, {
         kind: "assistant_text",
         id: entryId,
         ts: Date.now(),
@@ -179,8 +224,8 @@ function processStreamEvent(p: Record<string, unknown>) {
       });
     } else if (cbType === "tool_use") {
       const entryId = nextEntryId++;
-      openBlocks.set(idx, entryId);
-      pushTranscript({
+      blocks.set(idx, entryId);
+      pushTranscript(agentId, {
         kind: "tool_use",
         id: entryId,
         ts: Date.now(),
@@ -195,14 +240,14 @@ function processStreamEvent(p: Record<string, unknown>) {
   if (evType === "content_block_delta") {
     const idx = ev.index as number | undefined;
     if (idx == null) return;
-    const entryId = openBlocks.get(idx);
+    const entryId = blocks.get(idx);
     if (entryId == null) return;
     const delta = asRecord(ev.delta);
     if (!delta) return;
     const dType = delta.type as string | undefined;
     if (dType === "text_delta" && typeof delta.text === "string") {
       const chunk = delta.text as string;
-      updateEntry(entryId, (e) =>
+      updateEntry(agentId, entryId, (e) =>
         e.kind === "assistant_text" ? { ...e, text: e.text + chunk } : e,
       );
     } else if (
@@ -210,7 +255,7 @@ function processStreamEvent(p: Record<string, unknown>) {
       typeof delta.partial_json === "string"
     ) {
       const chunk = delta.partial_json as string;
-      updateEntry(entryId, (e) =>
+      updateEntry(agentId, entryId, (e) =>
         e.kind === "tool_use" ? { ...e, input: e.input + chunk } : e,
       );
     }
@@ -220,18 +265,18 @@ function processStreamEvent(p: Record<string, unknown>) {
   if (evType === "content_block_stop") {
     const idx = ev.index as number | undefined;
     if (idx == null) return;
-    const entryId = openBlocks.get(idx);
+    const entryId = blocks.get(idx);
     if (entryId != null) {
-      updateEntry(entryId, (e) =>
+      updateEntry(agentId, entryId, (e) =>
         "complete" in e ? { ...e, complete: true } : e,
       );
-      openBlocks.delete(idx);
+      blocks.delete(idx);
     }
   }
 }
 
-function processResultEvent(p: Record<string, unknown>) {
-  pushTranscript({
+function processResultEvent(agentId: string, p: Record<string, unknown>) {
+  pushTranscript(agentId, {
     kind: "result",
     id: nextEntryId++,
     ts: Date.now(),
@@ -256,12 +301,20 @@ function processResultEvent(p: Record<string, unknown>) {
 }
 
 function deriveLightTransitions(
-  prev: ClaudeStoreState,
-  payload: ClaudeEvent,
-): Partial<ClaudeStoreState> {
-  const out: Partial<ClaudeStoreState> = {};
+  prev: AgentRecord,
+  payload: ClaudeEventPayload,
+): Partial<AgentRecord> {
+  const out: Partial<AgentRecord> = {};
   const p = asRecord(payload);
   const type = p?.type as string | undefined;
+
+  if (
+    type === "system" &&
+    typeof p?.session_id === "string" &&
+    !prev.sessionId
+  ) {
+    out.sessionId = p.session_id as string;
+  }
 
   if (prev.status === "running") {
     if (type === "system" && typeof p?.model === "string") {
@@ -303,76 +356,128 @@ function deriveLightTransitions(
   return out;
 }
 
-function appendEvent(payload: ClaudeEvent) {
+function appendEvent(agentId: string, payload: ClaudeEventPayload) {
   setState((s) => {
-    const next = s.events.concat({
-      id: nextId++,
+    const a = s.agents[agentId];
+    if (!a) return s;
+    const events = a.events.concat({
+      id: nextEventId++,
       receivedAtMs: Date.now(),
       payload,
     });
-    if (next.length > MAX_EVENTS) next.splice(0, next.length - MAX_EVENTS);
-    const delta = deriveLightTransitions(s, payload);
-    return { ...s, events: next, ...delta };
+    if (events.length > MAX_EVENTS)
+      events.splice(0, events.length - MAX_EVENTS);
+    const delta = deriveLightTransitions(a, payload);
+    return {
+      ...s,
+      agents: { ...s.agents, [agentId]: { ...a, events, ...delta } },
+    };
   });
 
-  // Transcript parsing — runs after the light state update so order is preserved.
   const p = asRecord(payload);
   if (!p) return;
   const type = p.type as string | undefined;
-  if (type === "stream_event") processStreamEvent(p);
-  else if (type === "result") processResultEvent(p);
+  if (type === "stream_event") processStreamEvent(agentId, p);
+  else if (type === "result") processResultEvent(agentId, p);
+}
+
+function ensureAgent(
+  agentId: string,
+  startedAtMs: number,
+  requestedModel: ClaudeModel = "opus",
+) {
+  setState((s) => {
+    if (s.agents[agentId]) return s;
+    const index = s.agentOrder.length;
+    const color = AGENT_PALETTE[index % AGENT_PALETTE.length];
+    const agent: AgentRecord = {
+      id: agentId,
+      index,
+      color,
+      prompt: "",
+      startedAtMs,
+      status: "running",
+      agentState: "PLANNING",
+      exitCode: null,
+      lastError: null,
+      tokensUsed: 0,
+      tankCapacity: FUEL_TANK_TOKENS,
+      model: null,
+      requestedModel,
+      sessionId: null,
+      activeTool: null,
+      transcript: [],
+      events: [],
+    };
+    return {
+      ...s,
+      agents: { ...s.agents, [agentId]: agent },
+      agentOrder: [...s.agentOrder, agentId],
+      selectedId: s.selectedId ?? agentId,
+    };
+  });
 }
 
 function applyLifecycle(lc: ClaudeLifecycle) {
+  const { agent_id: agentId } = lc;
   switch (lc.kind) {
-    case "started":
-      if (completeTimer) {
-        clearTimeout(completeTimer);
-        completeTimer = null;
+    case "started": {
+      const existing = state.agents[agentId];
+      if (existing) {
+        const timer = completeTimers.get(agentId);
+        if (timer) {
+          clearTimeout(timer);
+          completeTimers.delete(agentId);
+        }
+        openBlocks.get(agentId)?.clear();
+        updateAgent(agentId, (a) => ({
+          ...a,
+          status: "running",
+          agentState: "PLANNING",
+          startedAtMs: lc.started_at_ms,
+          exitCode: null,
+          lastError: null,
+          tokensUsed: 0,
+          activeTool: null,
+        }));
+      } else {
+        ensureAgent(agentId, lc.started_at_ms);
       }
-      openBlocks.clear();
-      setState((s) => ({
-        ...s,
-        status: "running",
-        agentState: "PLANNING",
-        startedAtMs: lc.started_at_ms,
-        exitCode: null,
-        lastError: null,
-        tokensUsed: 0,
-        activeTool: null,
-      }));
       break;
+    }
     case "exited": {
       const ok = (lc.exit_code ?? 0) === 0;
-      setState((s) => ({
-        ...s,
+      updateAgent(agentId, (a) => ({
+        ...a,
         status: ok ? "idle" : "error",
         agentState:
-          s.agentState === "COMPLETE" || ok ? "COMPLETE" : "ERROR",
+          a.agentState === "COMPLETE" || ok ? "COMPLETE" : "ERROR",
         exitCode: lc.exit_code,
         activeTool: null,
       }));
-      if (completeTimer) clearTimeout(completeTimer);
-      completeTimer = setTimeout(() => {
-        setState((s) =>
-          s.agentState === "COMPLETE" || s.agentState === "ERROR"
-            ? { ...s, agentState: "IDLE" }
-            : s,
+      const existing = completeTimers.get(agentId);
+      if (existing) clearTimeout(existing);
+      const timer = setTimeout(() => {
+        updateAgent(agentId, (a) =>
+          a.agentState === "COMPLETE" || a.agentState === "ERROR"
+            ? { ...a, agentState: "IDLE" }
+            : a,
         );
-        completeTimer = null;
+        completeTimers.delete(agentId);
       }, COMPLETE_HOLD_MS);
+      completeTimers.set(agentId, timer);
       break;
     }
     case "error":
-      setState((s) => ({
-        ...s,
+      updateAgent(agentId, (a) => ({
+        ...a,
         status: "error",
         agentState: "ERROR",
         lastError: lc.message,
       }));
       break;
     case "stderr":
-      appendEvent({ type: "stderr", message: lc.message });
+      appendEvent(agentId, { type: "stderr", message: lc.message });
       break;
   }
 }
@@ -381,25 +486,56 @@ let wired = false;
 export function ensureWired() {
   if (wired) return;
   wired = true;
-  void onClaudeEvent(appendEvent);
+  void onClaudeEvent((e: ClaudeEvent) => appendEvent(e.agent_id, e.payload));
   void onClaudeLifecycle(applyLifecycle);
 }
 
-export const clearEvents = () =>
-  setState((s) => ({ ...s, events: [] }));
+export function registerAgent(
+  agentId: string,
+  prompt: string,
+  startedAtMs: number,
+  requestedModel: ClaudeModel = "opus",
+) {
+  ensureAgent(agentId, startedAtMs, requestedModel);
+  updateAgent(agentId, (a) => ({
+    ...a,
+    prompt,
+    requestedModel,
+    transcript: a.transcript.concat({
+      kind: "user",
+      id: nextEntryId++,
+      ts: Date.now(),
+      text: prompt,
+    }),
+  }));
+  setState((s) => ({ ...s, selectedId: agentId }));
+}
 
-export const clearTranscript = () => {
-  openBlocks.clear();
-  setState((s) => ({ ...s, transcript: [] }));
-};
+export function pushFollowUp(agentId: string, prompt: string) {
+  updateAgent(agentId, (a) => ({
+    ...a,
+    transcript: a.transcript.concat({
+      kind: "user",
+      id: nextEntryId++,
+      ts: Date.now(),
+      text: prompt,
+    }),
+  }));
+}
 
-export function pushUserPrompt(text: string) {
-  pushTranscript({
-    kind: "user",
-    id: nextEntryId++,
-    ts: Date.now(),
-    text,
-  });
+export function selectAgent(agentId: string) {
+  setState((s) =>
+    s.agents[agentId] ? { ...s, selectedId: agentId } : s,
+  );
+}
+
+export function clearEvents(agentId: string) {
+  updateAgent(agentId, (a) => ({ ...a, events: [] }));
+}
+
+export function clearTranscript(agentId: string) {
+  openBlocks.get(agentId)?.clear();
+  updateAgent(agentId, (a) => ({ ...a, transcript: [] }));
 }
 
 export function useClaudeStore<T>(selector: (s: ClaudeStoreState) => T): T {
@@ -408,4 +544,18 @@ export function useClaudeStore<T>(selector: (s: ClaudeStoreState) => T): T {
     () => selector(getSnapshot()),
     () => selector(getSnapshot()),
   );
+}
+
+export function useAgent(id: string | null): AgentRecord | null {
+  return useClaudeStore((s) => (id ? (s.agents[id] ?? null) : null));
+}
+
+export function useSelectedAgent(): AgentRecord | null {
+  return useClaudeStore((s) =>
+    s.selectedId ? (s.agents[s.selectedId] ?? null) : null,
+  );
+}
+
+export function useAgentList(): AgentRecord[] {
+  return useClaudeStore(() => cachedAgentList);
 }
